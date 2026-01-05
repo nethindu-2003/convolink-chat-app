@@ -1,0 +1,43 @@
+/* client/src/App.css */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Poppins:wght@500;600;700&display=swap');
+
+:root {
+  /* --- Brand Colors --- */
+  --primary: #3b82f6;       /* Bright Blue */
+  --primary-hover: #2563eb;
+  --accent: #06b6d4;        /* Cyan Glow */
+  
+  /* --- Dark Theme Palette --- */
+  --bg-dark: #0f172a;       /* Deepest Slate (Main BG) */
+  --bg-card: #1e293b;       /* Lighter Slate (Sidebar/Bubbles) */
+  --bg-input: #334155;      /* Inputs */
+  
+  /* --- Text Colors --- */
+  --text-main: #f8fafc;     /* White-ish */
+  --text-muted: #94a3b8;    /* Grey-ish */
+  
+  /* --- Chat Colors --- */
+  --bubble-me: #3b82f6;     /* My Message */
+  --bubble-friend: #1e293b; /* Friend Message */
+  
+  /* --- Utilities --- */
+  --radius: 10px;
+  --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: var(--bg-dark);
+  color: var(--text-main);
+  overflow-x: hidden;
+  font-size: 14px; 
+  line-height: 1.5;
+}
+
+/* Dark Scrollbar */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-dark); }
+::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #64748b; }

@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Database (Optional: Keep this if you want to upload your test messages, remove if you want a clean start)
+*.db
+
+# Environment variables (Safety)
+.env
+
+# System files
+.DS_Store
+Thumbs.db
