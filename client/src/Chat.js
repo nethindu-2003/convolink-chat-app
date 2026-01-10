@@ -492,8 +492,18 @@ function Chat() {
                                     <div key={index} className={`message-row ${isMe ? 'my-row' : 'friend-row'}`}>
                                         <div className={`message-bubble ${isMe ? 'my-bubble' : 'friend-bubble'}`}>
                                             {/* Show Sender Name in Groups (if not me) */}
-                                            {!isMe && selectedChat.type === 'group' && <span className="sender-name">{msg.sender_name || 'User'}</span>}
-                                            
+                                            {!isMe && selectedChat.type === 'group' && (
+                                                <span className="sender-name" style={{
+                                                    fontSize: '0.75rem', 
+                                                    fontWeight: 'bold', 
+                                                    color: '#fbbf24', 
+                                                    marginBottom: '4px', 
+                                                    display: 'block'
+                                                }}>
+                                                    {msg.sender_name || "Unknown User"} 
+                                                </span>
+                                            )}
+                                                                                    
                                             <p>{msg.content}</p>
                                             
                                             <div className="message-meta">

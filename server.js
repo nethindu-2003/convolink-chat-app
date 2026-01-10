@@ -1,38 +1,54 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
-const sqlite3 = require('sqlite3').verbose();
+const mysql = require('mysql2/promise'); 
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const crypto = require('crypto');
 
+// Initialize Express App and HTTP Server
 const app = express();
 const server = http.createServer(app);
 
-// 1. Middleware
-app.use(cors()); // Allow React to talk to this server
-app.use(express.json()); // Allow handling JSON data in POST requests
+// --- 1. MIDDLEWARE ---
+// CORS: Allows your React frontend (running on port 3000) to communicate with this backend
+app.use(cors()); 
+// JSON Parser: Allows the server to understand JSON data sent in POST requests
+app.use(express.json()); 
 
-const SECRET_KEY = "my_super_secret_key"; // In production, keep this in a .env file
+const SECRET_KEY = "my_super_secret_key"; // Secret used to sign JWT tokens (Keep safe in production)
 
-// 2. Database Setup
-const db = new sqlite3.Database('./chat_v2.db');
+// --- 2. DATABASE CONFIGURATION ---
+// We use a 'Pool' instead of a single connection.
+// A Pool manages multiple connections at once, which is better for high-traffic apps.
+// It automatically reuses connections so the server doesn't have to reconnect for every single user.
+const db = mysql.createPool({
+    host: 'localhost',      
+    port: 3307,             
+    user: 'root',           
+    password: '2003@Nethindu',   
+    database: 'chat_app',   
+    waitForConnections: true, // If all connections are busy, wait until one is free
+    connectionLimit: 10,      // Maximum 10 active connections at once
+    queueLimit: 0             // No limit on how many requests can wait in line
+});
 
-// --- ENCRYPTION SETTINGS ---
-const ENCRYPTION_KEY = "12345678901234567890123456789012"; 
-const IV_LENGTH = 16; 
+// --- 3. ENCRYPTION HELPERS ---
+// Messages are encrypted using AES-256-CBC before saving to the database.
+// This ensures that even if the database is hacked, the messages remain unreadable.
+const ENCRYPTION_KEY = "12345678901234567890123456789012"; // Must be 32 chars
+const IV_LENGTH = 16; // Initialization Vector length
 
-// Helper: Encrypt
 function encrypt(text) {
     let iv = crypto.randomBytes(IV_LENGTH);
     let cipher = crypto.createCipheriv('aes-256-cbc', Buffer.from(ENCRYPTION_KEY), iv);
     let encrypted = cipher.update(text);
     encrypted = Buffer.concat([encrypted, cipher.final()]);
-    return iv.toString('hex') + ':' + encrypted.toString('hex');
+    
+    return iv.toString('hex') + ':' + encrypted.toString('hex'); // Store IV with the encrypted data so we can decrypt it later
 }
 
-// Helper: Decrypt
 function decrypt(text) {
     try {
         let textParts = text.split(':');
@@ -43,58 +59,15 @@ function decrypt(text) {
         let decrypted = decipher.update(encryptedText);
         decrypted = Buffer.concat([decrypted, decipher.final()]);
         return decrypted.toString();
-    } catch (error) { return text; }
+    } catch (error) { return text; } 
 }
 
-// 3. Database Schema Initialization
-db.serialize(() => {
-    // Users Table
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        email TEXT UNIQUE, 
-        password TEXT,
-        avatar TEXT
-    )`);
-
-    // Groups Table (NEW)
-    db.run(`CREATE TABLE IF NOT EXISTS groups (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        created_by INTEGER,
-        avatar TEXT
-    )`);
-
-    // Group Members Table (NEW)
-    // Links users to groups
-    db.run(`CREATE TABLE IF NOT EXISTS group_members (
-        group_id INTEGER,
-        user_id INTEGER,
-        FOREIGN KEY(group_id) REFERENCES groups(id),
-        FOREIGN KEY(user_id) REFERENCES users(id)
-    )`);
-
-    // Messages Table (UPDATED)
-    // Now includes 'group_id' to support group chats
-    db.run(`CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sender_id INTEGER,
-        receiver_id INTEGER, -- Null if group message
-        group_id INTEGER,    -- Null if private message
-        content TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        is_edited INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'sent', 
-        FOREIGN KEY(sender_id) REFERENCES users(id),
-        FOREIGN KEY(receiver_id) REFERENCES users(id)
-    )`);
-});
-
+// Initialize Socket.io (Real-time Engine)
 const io = new Server(server, {
     cors: { origin: "http://localhost:3000", methods: ["GET", "POST"] }
 });
 
-// Track online users: Map<UserId, SocketId>
+// In-Memory Storage for Online Status
 let userSockets = new Map();
 
 const broadcastUserStatus = () => {
@@ -102,9 +75,9 @@ const broadcastUserStatus = () => {
     io.emit('online_users_update', onlineUserIds);
 };
 
-// --- AUTH ROUTES ---
+// --- 4. AUTHENTICATION ROUTES ---
 
-// Register
+// Registration Route
 app.post('/api/register', async (req, res) => {
     const { username, email, password, avatar } = req.body;
     if (!username || !email || !password) return res.status(400).json({ error: "All fields are required" });
@@ -112,119 +85,143 @@ app.post('/api/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, 10);
     const userAvatar = avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${username}`;
 
-    const stmt = db.prepare("INSERT INTO users (username, email, password, avatar) VALUES (?, ?, ?, ?)");
-    stmt.run(username, email, hashedPassword, userAvatar, function(err) {
-        if (err) {
-            if(err.message.includes('email')) return res.status(400).json({ error: "Email already exists" });
-            return res.status(400).json({ error: "Username already exists" });
-        }
-        res.json({ message: "User registered successfully" });
-    });
+    try {
+        // Execute SQL Insert
+        const [result] = await db.query(
+            "INSERT INTO users (username, email, password, avatar) VALUES (?, ?, ?, ?)",
+            [username, email, hashedPassword, userAvatar]
+        );
+        // 'insertId' contains the ID of the newly created user
+        res.json({ message: "User registered successfully", userId: result.insertId });
+    } catch (err) {
+        // Handle unique constraint violations (e.g., email already exists)
+        if (err.code === 'ER_DUP_ENTRY') return res.status(400).json({ error: "Username or Email already exists" });
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Login
-app.post('/api/login', (req, res) => {
+// Login Route
+app.post('/api/login', async (req, res) => {
     const { email, password } = req.body;
-    db.get("SELECT * FROM users WHERE email = ?", [email], async (err, user) => {
-        if (err || !user) return res.status(400).json({ error: "User not found" });
+    if (!email || !password) return res.status(400).json({ error: "All fields are required" });
 
-        const match = await bcrypt.compare(password, user.password);
-        if (match) {
-            const token = jwt.sign({ id: user.id, username: user.username }, SECRET_KEY, { expiresIn: '1h' });
-            res.json({ 
-                message: "Login successful", token, userId: user.id, 
-                username: user.username, email: user.email, avatar: user.avatar 
-            });
-        } else {
-            res.status(401).json({ error: "Invalid credentials" });
-        }
+    const [rows] = await db.query("SELECT * FROM users WHERE email = ?", [email]);
+    const user = rows[0]; // Get the first match
+
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+        return res.status(400).json({ error: "Invalid credentials" });
+    }
+
+    // Generate a JWT Token for session management
+    const token = jwt.sign({ id: user.id, username: user.username }, SECRET_KEY, { expiresIn: '1h' });
+    res.json({ 
+        message: "Login successful", token, 
+        userId: user.id, username: user.username, email: user.email, avatar: user.avatar 
     });
 });
 
-// Update Profile
+// Update Profile Route
 app.put('/api/users/:id', async (req, res) => {
     const userId = req.params.id;
     const { username, email, avatar } = req.body;
-    const stmt = db.prepare("UPDATE users SET username = ?, email = ?, avatar = ? WHERE id = ?");
-    stmt.run(username, email, avatar, userId, function(err) {
-        if (err) return res.status(400).json({ error: "Update failed." });
-        res.json({ message: "Profile updated successfully" });
-    });
-});
-
-// Get All Users (for creating chats)
-app.get('/api/users/:myId', (req, res) => {
-    const myId = req.params.myId;
-    db.all("SELECT id, username, avatar FROM users WHERE id != ?", [myId], (err, rows) => {
-        if(err) return res.status(500).json({error: err.message});
-        res.json(rows);
-    });
-});
-
-// --- NEW GROUP API ROUTES ---
-
-// 1. Create a New Group
-app.post('/api/groups', (req, res) => {
-    const { name, creatorId, members } = req.body; // members is an array of user IDs
     
-    // Create Group Entry
-    db.run("INSERT INTO groups (name, created_by, avatar) VALUES (?, ?, ?)", 
-    [name, creatorId, `https://api.dicebear.com/7.x/initials/svg?seed=${name}`], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        
-        const groupId = this.lastID;
-        
-        // Add Members to Group (Creator + Selected Members)
-        const allMembers = [creatorId, ...members];
-        
-        // Create placeholders like (?, ?), (?, ?) for bulk insert
-        const placeholders = allMembers.map(() => '(?, ?)').join(',');
-        const values = [];
-        allMembers.forEach(uid => { values.push(groupId, uid); });
-
-        db.run(`INSERT INTO group_members (group_id, user_id) VALUES ${placeholders}`, values, function(err) {
-            if (err) return res.status(500).json({ error: err.message });
-            
-            // Real-time: Notify all members that they have been added to a new group
-            allMembers.forEach(uid => {
-                const sId = userSockets.get(String(uid));
-                if(sId) io.to(sId).emit('group_created', { id: groupId, name });
-            });
-
-            res.json({ message: "Group created", groupId });
-        });
-    });
+    try {
+        await db.query("UPDATE users SET username = ?, email = ?, avatar = ? WHERE id = ?", 
+            [username, email, avatar, userId]
+        );
+        res.json({ message: "Profile updated successfully" });
+    } catch (err) {
+        res.status(400).json({ error: "Update failed." });
+    }
 });
 
-// 2. Get User's Groups
-app.get('/api/groups/user/:userId', (req, res) => {
-    db.all(`
-        SELECT g.* FROM groups g
-        JOIN group_members gm ON g.id = gm.group_id
-        WHERE gm.user_id = ?
-    `, [req.params.userId], (err, rows) => {
-        if(err) return res.status(500).json({error: err.message});
+// Get Users List (excluding self)
+app.get('/api/users/:myId', async (req, res) => {
+    const myId = req.params.myId;
+    try {
+        const [rows] = await db.query("SELECT id, username, avatar FROM users WHERE id != ?", [myId]);
         res.json(rows);
-    });
+    } catch (err) {
+        res.status(500).json({error: err.message});
+    }
 });
 
-// --- UNIFIED MESSAGE RETRIEVAL ---
-// This handles fetching messages for both Private Chats AND Groups
-app.get('/api/messages', (req, res) => {
-    const { userId, otherId, groupId } = req.query;
+// --- 5. GROUP MANAGEMENT ROUTES ---
 
+// Create Group Route
+// This uses a "Transaction" to ensure data integrity.
+// We must insert the Group AND insert the Members. If one fails, we undo everything.
+app.post('/api/groups', async (req, res) => {
+    const { name, creatorId, members } = req.body;
+    const avatar = `https://api.dicebear.com/7.x/initials/svg?seed=${name}`;
+    
+    // Get a dedicated connection from the pool for the transaction
+    const connection = await db.getConnection();
+    try {
+        await connection.beginTransaction(); // Start Transaction
+
+        // Step 1: Insert the Group
+        const [groupResult] = await connection.query(
+            "INSERT INTO chat_groups (name, created_by, avatar) VALUES (?, ?, ?)", 
+            [name, creatorId, avatar]
+        );
+        const groupId = groupResult.insertId;
+
+        // Step 2: Prepare Member Data for Bulk Insert
+        const allMembers = [creatorId, ...members];
+        const memberValues = allMembers.map(uid => [groupId, uid]);
+
+        // Bulk Insert members into linking table
+        await connection.query("INSERT INTO group_members (group_id, user_id) VALUES ?", [memberValues]);
+
+        await connection.commit(); // Success! Save changes.
+
+        // Notify online members immediately via Socket
+        allMembers.forEach(uid => {
+            const sId = userSockets.get(String(uid));
+            if(sId) io.to(sId).emit('group_created', { id: groupId, name });
+        });
+
+        res.json({ message: "Group created", groupId });
+    } catch (err) {
+        await connection.rollback(); // Error! Undo changes.
+        res.status(500).json({ error: err.message });
+    } finally {
+        connection.release(); // Return connection to pool
+    }
+});
+
+// Get User's Groups
+app.get('/api/groups/user/:userId', async (req, res) => {
+    try {
+        const [rows] = await db.query(`
+            SELECT g.* FROM chat_groups g
+            JOIN group_members gm ON g.id = gm.group_id
+            WHERE gm.user_id = ?
+        `, [req.params.userId]);
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({error: err.message});
+    }
+});
+
+// --- 6. MESSAGE ROUTES ---
+
+// Fetch Messages (Supports both Private and Group chats)
+app.get('/api/messages', async (req, res) => {
+    const { userId, otherId, groupId } = req.query;
     let sql = '';
     let params = [];
 
     if (groupId) {
-        // Fetch Group Messages (Join with users table to get sender details)
+        // Group Logic: Join with User table to get Sender Name/Avatar for UI display
         sql = `SELECT m.*, u.username as sender_name, u.avatar as sender_avatar 
                FROM messages m 
                JOIN users u ON m.sender_id = u.id
                WHERE m.group_id = ? ORDER BY timestamp ASC`;
         params = [groupId];
     } else {
-        // Fetch Private Messages
+        // Private Logic: Fetch messages where (Sender=Me & Receiver=You) OR (Sender=You & Receiver=Me)
         sql = `SELECT * FROM messages 
                WHERE (sender_id = ? AND receiver_id = ?) 
                   OR (sender_id = ? AND receiver_id = ?) 
@@ -232,156 +229,189 @@ app.get('/api/messages', (req, res) => {
         params = [userId, otherId, otherId, userId];
     }
 
-    db.all(sql, params, (err, rows) => {
-        if(err) return res.status(500).json({error: err.message});
-        // Decrypt messages before sending to client
+    try {
+        const [rows] = await db.query(sql, params);
+        // Decrypt the content of every message before sending to frontend
         const decryptedRows = rows.map(msg => ({ ...msg, content: decrypt(msg.content) }));
         res.json(decryptedRows);
-    });
+    } catch (err) {
+        res.status(500).json({error: err.message});
+    }
 });
 
-// --- MESSAGE ACTIONS (Edit/Delete) ---
-
-app.put('/api/messages/:id', (req, res) => {
+// Edit Message Route
+app.put('/api/messages/:id', async (req, res) => {
     const messageId = req.params.id;
     const { userId, newContent } = req.body;
 
-    db.get("SELECT * FROM messages WHERE id = ?", [messageId], (err, msg) => {
-        if (err || !msg) return res.status(404).json({ error: "Message not found" });
+    try {
+        // Verify ownership before editing
+        const [rows] = await db.query("SELECT * FROM messages WHERE id = ?", [messageId]);
+        const msg = rows[0];
+
+        if (!msg) return res.status(404).json({ error: "Message not found" });
         if (String(msg.sender_id) !== String(userId)) return res.status(403).json({ error: "Unauthorized" });
 
         const encryptedContent = encrypt(newContent);
-        const stmt = db.prepare("UPDATE messages SET content = ?, is_edited = 1 WHERE id = ?");
-        stmt.run(encryptedContent, messageId, function(err) {
-            if (err) return res.status(500).json({ error: "Update failed" });
+        
+        // Update DB
+        await db.query("UPDATE messages SET content = ?, is_edited = 1 WHERE id = ?", [encryptedContent, messageId]);
 
-            const updateData = { id: messageId, content: newContent };
-            
-            // Notify appropriate parties
-            if (msg.group_id) {
-                io.to(`group_${msg.group_id}`).emit('message_updated', updateData);
-            } else {
-                const receiverSocket = userSockets.get(String(msg.receiver_id));
-                const senderSocket = userSockets.get(String(msg.sender_id));
-                if (receiverSocket) io.to(receiverSocket).emit('message_updated', updateData);
-                if (senderSocket) io.to(senderSocket).emit('message_updated', updateData);
-            }
-            res.json({ message: "Updated successfully" });
-        });
-    });
+        // Real-time Update Broadcast
+        const updateData = { id: messageId, content: newContent };
+        
+        if (msg.group_id) {
+            io.to(`group_${msg.group_id}`).emit('message_updated', updateData);
+        } else {
+            const receiverSocket = userSockets.get(String(msg.receiver_id));
+            const senderSocket = userSockets.get(String(msg.sender_id));
+            if (receiverSocket) io.to(receiverSocket).emit('message_updated', updateData);
+            if (senderSocket) io.to(senderSocket).emit('message_updated', updateData);
+        }
+        res.json({ message: "Updated successfully" });
+    } catch (err) {
+        res.status(500).json({ error: "Update failed" });
+    }
 });
 
-app.delete('/api/messages/:id', (req, res) => {
+// Delete Message Route
+app.delete('/api/messages/:id', async (req, res) => {
     const messageId = req.params.id;
     const { userId } = req.body; 
 
-    db.get("SELECT * FROM messages WHERE id = ?", [messageId], (err, msg) => {
-        if (err || !msg) return res.status(404).json({ error: "Message not found" });
+    try {
+        const [rows] = await db.query("SELECT * FROM messages WHERE id = ?", [messageId]);
+        const msg = rows[0];
+
+        if (!msg) return res.status(404).json({ error: "Message not found" });
         if (String(msg.sender_id) !== String(userId)) return res.status(403).json({ error: "Unauthorized" });
 
-        db.run("DELETE FROM messages WHERE id = ?", [messageId], function(err) {
-            if (err) return res.status(500).json({ error: "Failed to delete" });
+        await db.query("DELETE FROM messages WHERE id = ?", [messageId]);
 
-            // Notify appropriate parties
-            if (msg.group_id) {
-                io.to(`group_${msg.group_id}`).emit('message_deleted', messageId);
-            } else {
-                const receiverSocket = userSockets.get(String(msg.receiver_id));
-                const senderSocket = userSockets.get(String(msg.sender_id));
-                if (receiverSocket) io.to(receiverSocket).emit('message_deleted', messageId);
-                if (senderSocket) io.to(senderSocket).emit('message_deleted', messageId);
-            }
-            res.json({ message: "Deleted successfully" });
-        });
-    });
+        // Real-time Delete Broadcast
+        if (msg.group_id) {
+            io.to(`group_${msg.group_id}`).emit('message_deleted', messageId);
+        } else {
+            const receiverSocket = userSockets.get(String(msg.receiver_id));
+            const senderSocket = userSockets.get(String(msg.sender_id));
+            if (receiverSocket) io.to(receiverSocket).emit('message_deleted', messageId);
+            if (senderSocket) io.to(senderSocket).emit('message_deleted', messageId);
+        }
+        res.json({ message: "Deleted successfully" });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to delete" });
+    }
 });
 
-// Leave Group
-app.post('/api/groups/leave', (req, res) => {
+// Leave Group Route
+app.post('/api/groups/leave', async (req, res) => {
     const { groupId, userId } = req.body;
     
-    // Remove user from the group members table
-    db.run("DELETE FROM group_members WHERE group_id = ? AND user_id = ?", [groupId, userId], function(err) {
-        if (err) return res.status(500).json({ error: "Failed to leave group" });
-        
-        // Optional: If group has 0 members, delete the group entirely
-        db.get("SELECT count(*) as count FROM group_members WHERE group_id = ?", [groupId], (err, row) => {
-            if (!err && row.count === 0) {
-                db.run("DELETE FROM groups WHERE id = ?", [groupId]);
-            }
-        });
+    try {
+        // Remove the member link
+        await db.query("DELETE FROM group_members WHERE group_id = ? AND user_id = ?", [groupId, userId]);
+
+        // Cleanup: If the group has 0 members left, delete the group definition
+        const [rows] = await db.query("SELECT count(*) as count FROM group_members WHERE group_id = ?", [groupId]);
+        if (rows[0].count === 0) {
+            await db.query("DELETE FROM chat_groups WHERE id = ?", [groupId]);
+        }
 
         res.json({ message: "Left group successfully" });
-    });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to leave group" });
+    }
 });
 
-// --- SOCKET IO LOGIC ---
-io.on('connection', (socket) => {
+// --- 7. REAL-TIME SOCKET EVENTS ---
+
+io.on('connection', async (socket) => {
     const userId = socket.handshake.query.userId;
     if(userId) {
+        // Store the user's socket ID so we can send private messages later
         userSockets.set(userId, socket.id);
         console.log(`User ${userId} connected`);
         broadcastUserStatus();
 
-        // ** IMPORTANT: Join all group rooms this user belongs to **
-        db.all("SELECT group_id FROM group_members WHERE user_id = ?", [userId], (err, rows) => {
-            if(!err && rows) {
-                rows.forEach(row => socket.join(`group_${row.group_id}`));
-            }
-        });
+        // Join Group Rooms
+        // This ensures the user receives messages sent to any group they belong to
+        try {
+            const [rows] = await db.query("SELECT group_id FROM group_members WHERE user_id = ?", [userId]);
+            rows.forEach(row => socket.join(`group_${row.group_id}`));
+        } catch (e) { console.error(e); }
     }
 
-    // --- Unified Message Handler (Group & Private) ---
-    socket.on('send_message', (data) => {
+    // Handle Sending Messages
+    socket.on('send_message', async (data) => {
         const { sender_id, receiver_id, group_id, content, timestamp } = data;
         const encryptedContent = encrypt(content);
 
-        // Determine if receiver is online (only for private chat status)
+        const mysqlTimestamp = new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
+        // Auto-detect status (Sent vs Delivered)
         let initialStatus = 'sent';
         if (!group_id) {
             const receiverSocketId = userSockets.get(String(receiver_id));
             if (receiverSocketId) initialStatus = 'delivered';
         }
 
-        const stmt = db.prepare("INSERT INTO messages (sender_id, receiver_id, group_id, content, timestamp, status) VALUES (?, ?, ?, ?, ?, ?)");
-        stmt.run(sender_id, receiver_id, group_id, encryptedContent, timestamp, initialStatus, function(err) {
-            if (err) return console.error(err);
-            
+        try {
+            // Save to MySQL Database
+            const [result] = await db.query(
+                "INSERT INTO messages (sender_id, receiver_id, group_id, content, timestamp, status) VALUES (?, ?, ?, ?, ?, ?)",
+                [sender_id, receiver_id, group_id, encryptedContent, mysqlTimestamp, initialStatus]
+            );
+            const [userRows] = await db.query("SELECT username FROM users WHERE id = ?", [sender_id]);
+            const senderName = userRows[0]?.username || "User";
+
+            // Construct payload to send to clients (includes the new DB ID)
             const msgData = { 
-                id: this.lastID, sender_id, receiver_id, group_id, content, timestamp,
-                status: initialStatus 
+                id: result.insertId, sender_id, receiver_id, group_id, content, timestamp,
+                status: initialStatus, sender_name: senderName
             };
 
+            // Broadcast Logic
             if (group_id) {
-                // BROADCAST TO GROUP ROOM
+                // Send to everyone in the Group Room
                 io.to(`group_${group_id}`).emit('receive_message', msgData);
             } else {
-                // PRIVATE MESSAGE
+                // Send Private Message to Receiver & Sender
                 const receiverSocketId = userSockets.get(String(receiver_id));
                 const senderSocketId = userSockets.get(String(sender_id));
                 if (receiverSocketId) io.to(receiverSocketId).emit('receive_message', msgData); 
                 if (senderSocketId) io.to(senderSocketId).emit('receive_message', msgData);
             }
-        });
+        } catch (err) { console.error("Message send error:", err); }
     });
 
-    // Handle "Mark as Read" (Private Chat Only)
-    socket.on('mark_read', (data) => {
+    // Handle Read Receipts (Double Blue Ticks)
+    socket.on('mark_read', async (data) => {
         const { sender_id, receiver_id } = data;
-        const stmt = db.prepare("UPDATE messages SET status = 'read' WHERE sender_id = ? AND receiver_id = ? AND status != 'read'");
-        stmt.run(sender_id, receiver_id, function(err) {
-            if (!err && this.changes > 0) {
+        try {
+            // Update all unread messages in DB
+            const [result] = await db.query(
+                "UPDATE messages SET status = 'read' WHERE sender_id = ? AND receiver_id = ? AND status != 'read'", 
+                [sender_id, receiver_id]
+            );
+
+            // Notify original sender that their messages were read
+            if (result.affectedRows > 0) {
                 const senderSocket = userSockets.get(String(sender_id));
                 if (senderSocket) io.to(senderSocket).emit('messages_read_update', { reader_id: receiver_id });
             }
-        });
+        } catch (err) { console.error(err); }
     });
 
-    // Real-time update when added to new group
+    // Event: User created a group -> They join the room immediately
     socket.on('join_group', (groupId) => {
         socket.join(`group_${groupId}`);
     });
 
+    // Event: User left a group -> Remove them from the room
+    socket.on('leave_group', (groupId) => {
+        socket.leave(`group_${groupId}`);
+    });
+
+    // Cleanup on Disconnect
     socket.on('disconnect', () => {
         if(userId) {
             userSockets.delete(userId);
@@ -389,15 +419,8 @@ io.on('connection', (socket) => {
             broadcastUserStatus(); 
         }
     });
-
-    // Handle Leaving a Group Room
-    socket.on('leave_group', (groupId) => {
-        socket.leave(`group_${groupId}`);
-        console.log(`User left group room ${groupId}`);
-    });
 });
 
-// Start Server
 server.listen(4000, () => {
     console.log('Server running on http://localhost:4000');
 });
