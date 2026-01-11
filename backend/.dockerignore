@@ -1,0 +1,15 @@
+# Ignore dependency files (we install them fresh inside the image)
+node_modules
+npm-debug.log
+
+# Ignore git history
+.git
+.gitignore
+
+# Ignore sensitive environment files (NEVER build secrets into an image)
+.env
+.env.local
+
+# Ignore Docker files
+Dockerfile
+.dockerignore

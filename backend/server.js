@@ -6,6 +6,9 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const crypto = require('crypto');
+const { createClient } = require("redis");
+const { createAdapter } = require("@socket.io/redis-adapter");
+require('dotenv').config();
 
 // Initialize Express App and HTTP Server
 const app = express();
@@ -17,18 +20,18 @@ app.use(cors());
 // JSON Parser: Allows the server to understand JSON data sent in POST requests
 app.use(express.json()); 
 
-const SECRET_KEY = "my_super_secret_key"; // Secret used to sign JWT tokens (Keep safe in production)
+const SECRET_KEY = process.env.JWT_SECRET; // Secret used to sign JWT tokens (Keep safe in production)
 
 // --- 2. DATABASE CONFIGURATION ---
 // We use a 'Pool' instead of a single connection.
 // A Pool manages multiple connections at once, which is better for high-traffic apps.
 // It automatically reuses connections so the server doesn't have to reconnect for every single user.
 const db = mysql.createPool({
-    host: 'localhost',      
-    port: 3307,             
-    user: 'root',           
-    password: '2003@Nethindu',   
-    database: 'chat_app',   
+    host: process.env.DB_HOST,      
+    port: process.env.DB_PORT,             
+    user: process.env.DB_USER,           
+    password: process.env.DB_PASSWORD,   
+    database: process.env.DB_NAME,   
     waitForConnections: true, // If all connections are busy, wait until one is free
     connectionLimit: 10,      // Maximum 10 active connections at once
     queueLimit: 0             // No limit on how many requests can wait in line
@@ -37,7 +40,7 @@ const db = mysql.createPool({
 // --- 3. ENCRYPTION HELPERS ---
 // Messages are encrypted using AES-256-CBC before saving to the database.
 // This ensures that even if the database is hacked, the messages remain unreadable.
-const ENCRYPTION_KEY = "12345678901234567890123456789012"; // Must be 32 chars
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY; // Must be 32 chars
 const IV_LENGTH = 16; // Initialization Vector length
 
 function encrypt(text) {
@@ -62,17 +65,33 @@ function decrypt(text) {
     } catch (error) { return text; } 
 }
 
+const REDIS_URL = process.env.REDIS_URL;
+
+const pubClient = createClient({ url: REDIS_URL });
+const subClient = pubClient.duplicate();
+
+// Connect to Redis
+Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
+    // This allows Server A to send messages to users connected to Server B
+    io.adapter(createAdapter(pubClient, subClient));
+    console.log("Connected to Redis Cloud");
+});
+
 // Initialize Socket.io (Real-time Engine)
 const io = new Server(server, {
     cors: { origin: "http://localhost:3000", methods: ["GET", "POST"] }
 });
 
-// In-Memory Storage for Online Status
-let userSockets = new Map();
 
-const broadcastUserStatus = () => {
-    const onlineUserIds = Array.from(userSockets.keys());
-    io.emit('online_users_update', onlineUserIds);
+
+const broadcastUserStatus = async () => {
+    try {
+        // Ask Redis for the list (returns Strings)
+        const onlineIds = await pubClient.sMembers("online_users");
+        io.emit('online_users_update', onlineIds);
+    } catch (err) {
+        console.error("Error fetching online users:", err);
+    }
 };
 
 // --- 4. AUTHENTICATION ROUTES ---
@@ -178,8 +197,8 @@ app.post('/api/groups', async (req, res) => {
 
         // Notify online members immediately via Socket
         allMembers.forEach(uid => {
-            const sId = userSockets.get(String(uid));
-            if(sId) io.to(sId).emit('group_created', { id: groupId, name });
+            // Send to the user's "Personal Room" (Works on all servers)
+            io.to(`user_${uid}`).emit('group_created', { id: groupId, name });
         });
 
         res.json({ message: "Group created", groupId });
@@ -263,10 +282,9 @@ app.put('/api/messages/:id', async (req, res) => {
         if (msg.group_id) {
             io.to(`group_${msg.group_id}`).emit('message_updated', updateData);
         } else {
-            const receiverSocket = userSockets.get(String(msg.receiver_id));
-            const senderSocket = userSockets.get(String(msg.sender_id));
-            if (receiverSocket) io.to(receiverSocket).emit('message_updated', updateData);
-            if (senderSocket) io.to(senderSocket).emit('message_updated', updateData);
+            // Send to Personal Rooms
+            io.to(`user_${msg.receiver_id}`).emit('message_updated', updateData);
+            io.to(`user_${msg.sender_id}`).emit('message_updated', updateData);
         }
         res.json({ message: "Updated successfully" });
     } catch (err) {
@@ -292,10 +310,8 @@ app.delete('/api/messages/:id', async (req, res) => {
         if (msg.group_id) {
             io.to(`group_${msg.group_id}`).emit('message_deleted', messageId);
         } else {
-            const receiverSocket = userSockets.get(String(msg.receiver_id));
-            const senderSocket = userSockets.get(String(msg.sender_id));
-            if (receiverSocket) io.to(receiverSocket).emit('message_deleted', messageId);
-            if (senderSocket) io.to(senderSocket).emit('message_deleted', messageId);
+            io.to(`user_${msg.receiver_id}`).emit('message_deleted', messageId);
+            io.to(`user_${msg.sender_id}`).emit('message_deleted', messageId);
         }
         res.json({ message: "Deleted successfully" });
     } catch (err) {
@@ -329,9 +345,13 @@ io.on('connection', async (socket) => {
     const userId = socket.handshake.query.userId;
     if(userId) {
         // Store the user's socket ID so we can send private messages later
-        userSockets.set(userId, socket.id);
+        //userSockets.set(userId, socket.id);
+        socket.join(`user_${userId}`);
         console.log(`User ${userId} connected`);
-        broadcastUserStatus();
+        // REDIS: Add user to the "online_users" Set
+        await pubClient.sAdd("online_users", userId);
+        // Notify everyone (fetches the combined list from Redis)
+        await broadcastUserStatus();
 
         // Join Group Rooms
         // This ensures the user receives messages sent to any group they belong to
@@ -341,18 +361,17 @@ io.on('connection', async (socket) => {
         } catch (e) { console.error(e); }
     }
 
-    // Handle Sending Messages
+    // Handle Sending Messages (Distributed Version)
     socket.on('send_message', async (data) => {
         const { sender_id, receiver_id, group_id, content, timestamp } = data;
         const encryptedContent = encrypt(content);
 
+        // Format Date for MySQL
         const mysqlTimestamp = new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
-        // Auto-detect status (Sent vs Delivered)
+        
+        //  STATUS CHANGE: Default to 'sent'. 
+        // We cannot check 'userSockets' anymore because the user might be on Server B.
         let initialStatus = 'sent';
-        if (!group_id) {
-            const receiverSocketId = userSockets.get(String(receiver_id));
-            if (receiverSocketId) initialStatus = 'delivered';
-        }
 
         try {
             // Save to MySQL Database
@@ -360,25 +379,27 @@ io.on('connection', async (socket) => {
                 "INSERT INTO messages (sender_id, receiver_id, group_id, content, timestamp, status) VALUES (?, ?, ?, ?, ?, ?)",
                 [sender_id, receiver_id, group_id, encryptedContent, mysqlTimestamp, initialStatus]
             );
+            
+            // Get Sender Name (for UI display)
             const [userRows] = await db.query("SELECT username FROM users WHERE id = ?", [sender_id]);
             const senderName = userRows[0]?.username || "User";
 
-            // Construct payload to send to clients (includes the new DB ID)
+            // Construct payload
             const msgData = { 
                 id: result.insertId, sender_id, receiver_id, group_id, content, timestamp,
                 status: initialStatus, sender_name: senderName
             };
 
-            // Broadcast Logic
+            // 2. EMIT LOGIC CHANGE: Use Rooms instead of Socket IDs
             if (group_id) {
-                // Send to everyone in the Group Room
+                // Send to Group Room (Redis handles broadcasting to all servers)
                 io.to(`group_${group_id}`).emit('receive_message', msgData);
             } else {
-                // Send Private Message to Receiver & Sender
-                const receiverSocketId = userSockets.get(String(receiver_id));
-                const senderSocketId = userSockets.get(String(sender_id));
-                if (receiverSocketId) io.to(receiverSocketId).emit('receive_message', msgData); 
-                if (senderSocketId) io.to(senderSocketId).emit('receive_message', msgData);
+                // Send to Receiver's Personal Room (Redis finds them on ANY server)
+                io.to(`user_${receiver_id}`).emit('receive_message', msgData);
+                
+                // Send back to Sender (so their UI updates with the confirmed DB ID)
+                io.to(`user_${sender_id}`).emit('receive_message', msgData);
             }
         } catch (err) { console.error("Message send error:", err); }
     });
@@ -395,8 +416,7 @@ io.on('connection', async (socket) => {
 
             // Notify original sender that their messages were read
             if (result.affectedRows > 0) {
-                const senderSocket = userSockets.get(String(sender_id));
-                if (senderSocket) io.to(senderSocket).emit('messages_read_update', { reader_id: receiver_id });
+                io.to(`user_${sender_id}`).emit('messages_read_update', { reader_id: receiver_id });
             }
         } catch (err) { console.error(err); }
     });
@@ -412,15 +432,20 @@ io.on('connection', async (socket) => {
     });
 
     // Cleanup on Disconnect
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
         if(userId) {
-            userSockets.delete(userId);
+            // REDIS: Remove user from the set
+            await pubClient.sRem("online_users", userId);
+            
             console.log(`User ${userId} disconnected`);
-            broadcastUserStatus(); 
+            
+            // Notify everyone that the list changed
+            await broadcastUserStatus(); 
         }
     });
 });
 
-server.listen(4000, () => {
-    console.log('Server running on http://localhost:4000');
+const PORT = process.env.PORT || 4000;
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
 });

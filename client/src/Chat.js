@@ -95,7 +95,9 @@ function Chat() {
 
         // C. Online Status Updates
         socket.on('online_users_update', (onlineIds) => {
-            setOnlineUserIds(new Set(onlineIds)); 
+            // Convert every ID to a String before saving to the Set
+            const stringIds = onlineIds.map(id => String(id));
+            setOnlineUserIds(new Set(stringIds)); 
         });
 
         // D. Message Deleted
