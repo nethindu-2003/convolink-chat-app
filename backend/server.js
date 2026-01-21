@@ -1,4 +1,4 @@
-const express = require('express');
+const express = require ('express');
 const http = require('http');
 const { Server } = require("socket.io");
 const mysql = require('mysql2/promise'); 
@@ -64,22 +64,18 @@ function decrypt(text) {
         return decrypted.toString();
     } catch (error) { return text; } 
 }
-
-const REDIS_URL = process.env.REDIS_URL;
-
-const pubClient = createClient({ url: REDIS_URL });
+// --- 4. REDIS CONFIGURATION ---
+const pubClient = createClient({ url: process.env.REDIS_URL });
 const subClient = pubClient.duplicate();
 
-// Connect to Redis
-Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
-    // This allows Server A to send messages to users connected to Server B
-    io.adapter(createAdapter(pubClient, subClient));
-    console.log("Connected to Redis Cloud");
-});
+// --- ADD THESE TWO LINES TO PREVENT CRASHING ---
+pubClient.on('error', (err) => console.error('Redis Pub Client Error:', err));
+subClient.on('error', (err) => console.error('Redis Sub Client Error:', err));
 
 // Initialize Socket.io (Real-time Engine)
 const io = new Server(server, {
-    cors: { origin: "http://localhost:3000", methods: ["GET", "POST"] }
+    cors: { origin: "http://localhost:3000", methods: ["GET", "POST"] },
+    adapter: createAdapter(pubClient, subClient)
 });
 
 
@@ -339,113 +335,98 @@ app.post('/api/groups/leave', async (req, res) => {
     }
 });
 
-// --- 7. REAL-TIME SOCKET EVENTS ---
+// Connect to Redis
+Promise.all([pubClient.connect(), subClient.connect()])
+    .then(() => {
+        console.log("Connected to Redis Cloud");
 
-io.on('connection', async (socket) => {
-    const userId = socket.handshake.query.userId;
-    if(userId) {
-        // Store the user's socket ID so we can send private messages later
-        //userSockets.set(userId, socket.id);
-        socket.join(`user_${userId}`);
-        console.log(`User ${userId} connected`);
-        // REDIS: Add user to the "online_users" Set
-        await pubClient.sAdd("online_users", userId);
-        // Notify everyone (fetches the combined list from Redis)
-        await broadcastUserStatus();
+        // A. Setup Adapter
+        io.adapter(createAdapter(pubClient, subClient));
 
-        // Join Group Rooms
-        // This ensures the user receives messages sent to any group they belong to
-        try {
-            const [rows] = await db.query("SELECT group_id FROM group_members WHERE user_id = ?", [userId]);
-            rows.forEach(row => socket.join(`group_${row.group_id}`));
-        } catch (e) { console.error(e); }
-    }
-
-    // Handle Sending Messages (Distributed Version)
-    socket.on('send_message', async (data) => {
-        const { sender_id, receiver_id, group_id, content, timestamp } = data;
-        const encryptedContent = encrypt(content);
-
-        // Format Date for MySQL
-        const mysqlTimestamp = new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
-        
-        //  STATUS CHANGE: Default to 'sent'. 
-        // We cannot check 'userSockets' anymore because the user might be on Server B.
-        let initialStatus = 'sent';
-
-        try {
-            // Save to MySQL Database
-            const [result] = await db.query(
-                "INSERT INTO messages (sender_id, receiver_id, group_id, content, timestamp, status) VALUES (?, ?, ?, ?, ?, ?)",
-                [sender_id, receiver_id, group_id, encryptedContent, mysqlTimestamp, initialStatus]
-            );
+        // B. Define Socket Logic
+        io.on('connection', async (socket) => {
+            console.log(`User connected to worker ${process.pid}: ${socket.id}`);
+            const userId = socket.handshake.query.userId;
             
-            // Get Sender Name (for UI display)
-            const [userRows] = await db.query("SELECT username FROM users WHERE id = ?", [sender_id]);
-            const senderName = userRows[0]?.username || "User";
-
-            // Construct payload
-            const msgData = { 
-                id: result.insertId, sender_id, receiver_id, group_id, content, timestamp,
-                status: initialStatus, sender_name: senderName
-            };
-
-            // 2. EMIT LOGIC CHANGE: Use Rooms instead of Socket IDs
-            if (group_id) {
-                // Send to Group Room (Redis handles broadcasting to all servers)
-                io.to(`group_${group_id}`).emit('receive_message', msgData);
-            } else {
-                // Send to Receiver's Personal Room (Redis finds them on ANY server)
-                io.to(`user_${receiver_id}`).emit('receive_message', msgData);
+            if(userId) {
+                // Join personal room
+                socket.join(`user_${userId}`);
+                console.log(`User ${userId} connected`);
                 
-                // Send back to Sender (so their UI updates with the confirmed DB ID)
-                io.to(`user_${sender_id}`).emit('receive_message', msgData);
+                // Add to Redis Set
+                await pubClient.sAdd("online_users", userId);
+                await broadcastUserStatus();
+
+                // Join Group Rooms
+                try {
+                    const [rows] = await db.query("SELECT group_id FROM group_members WHERE user_id = ?", [userId]);
+                    rows.forEach(row => socket.join(`group_${row.group_id}`));
+                } catch (e) { console.error(e); }
             }
-        } catch (err) { console.error("Message send error:", err); }
+
+            // Handle Messages
+            socket.on('send_message', async (data) => {
+                const { sender_id, receiver_id, group_id, content, timestamp } = data;
+                const encryptedContent = encrypt(content);
+                const mysqlTimestamp = new Date(timestamp).toISOString().slice(0, 19).replace('T', ' ');
+                let initialStatus = 'sent';
+
+                try {
+                    const [result] = await db.query(
+                        "INSERT INTO messages (sender_id, receiver_id, group_id, content, timestamp, status) VALUES (?, ?, ?, ?, ?, ?)",
+                        [sender_id, receiver_id, group_id, encryptedContent, mysqlTimestamp, initialStatus]
+                    );
+                    
+                    const [userRows] = await db.query("SELECT username FROM users WHERE id = ?", [sender_id]);
+                    const senderName = userRows[0]?.username || "User";
+                    const msgData = { 
+                        id: result.insertId, sender_id, receiver_id, group_id, content, timestamp,
+                        status: initialStatus, sender_name: senderName
+                    };
+
+                    if (group_id) {
+                        io.to(`group_${group_id}`).emit('receive_message', msgData);
+                    } else {
+                        io.to(`user_${receiver_id}`).emit('receive_message', msgData);
+                        io.to(`user_${sender_id}`).emit('receive_message', msgData);
+                    }
+                } catch (err) { console.error("Message send error:", err); }
+            });
+
+            // Read Receipts
+            socket.on('mark_read', async (data) => {
+                const { sender_id, receiver_id } = data;
+                try {
+                    const [result] = await db.query(
+                        "UPDATE messages SET status = 'read' WHERE sender_id = ? AND receiver_id = ? AND status != 'read'", 
+                        [sender_id, receiver_id]
+                    );
+                    if (result.affectedRows > 0) {
+                        io.to(`user_${sender_id}`).emit('messages_read_update', { reader_id: receiver_id });
+                    }
+                } catch (err) { console.error(err); }
+            });
+
+            socket.on('join_group', (groupId) => socket.join(`group_${groupId}`));
+            socket.on('leave_group', (groupId) => socket.leave(`group_${groupId}`));
+
+            socket.on('disconnect', async () => {
+                if(userId) {
+                    await pubClient.sRem("online_users", userId);
+                    console.log(`User ${userId} disconnected`);
+                    await broadcastUserStatus(); 
+                }
+            });
+        });
+
+        // C. Start Server (OUTSIDE io.on, INSIDE Promise.then)
+        const PORT = process.env.PORT || 4000;
+        server.listen(PORT, () => {
+            console.log(`Server running on port ${PORT}`);
+        });
+
+    })
+    .catch((err) => {
+        console.error("Redis Connection Failed", err);
+        process.exit(1);
     });
-
-    // Handle Read Receipts (Double Blue Ticks)
-    socket.on('mark_read', async (data) => {
-        const { sender_id, receiver_id } = data;
-        try {
-            // Update all unread messages in DB
-            const [result] = await db.query(
-                "UPDATE messages SET status = 'read' WHERE sender_id = ? AND receiver_id = ? AND status != 'read'", 
-                [sender_id, receiver_id]
-            );
-
-            // Notify original sender that their messages were read
-            if (result.affectedRows > 0) {
-                io.to(`user_${sender_id}`).emit('messages_read_update', { reader_id: receiver_id });
-            }
-        } catch (err) { console.error(err); }
-    });
-
-    // Event: User created a group -> They join the room immediately
-    socket.on('join_group', (groupId) => {
-        socket.join(`group_${groupId}`);
-    });
-
-    // Event: User left a group -> Remove them from the room
-    socket.on('leave_group', (groupId) => {
-        socket.leave(`group_${groupId}`);
-    });
-
-    // Cleanup on Disconnect
-    socket.on('disconnect', async () => {
-        if(userId) {
-            // REDIS: Remove user from the set
-            await pubClient.sRem("online_users", userId);
-            
-            console.log(`User ${userId} disconnected`);
-            
-            // Notify everyone that the list changed
-            await broadcastUserStatus(); 
-        }
-    });
-});
-
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});

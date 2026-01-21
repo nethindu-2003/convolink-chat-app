@@ -1,29 +1,45 @@
 version: '3.8'
 
 services:
+  # --- 1. LOAD BALANCER (NGINX) ---
+  nginx:
+    image: nginx:alpine
+    container_name: chat_nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "4000:80" # Maps your Laptop's 4000 to Nginx
+    depends_on:
+      - backend_4000
+      - backend_4001
+    restart: always
+
+  # --- 2. FRONTEND (React) ---
   frontend:
     build:
       context: ./client
       dockerfile: Dockerfile
       args:
-        REACT_APP_API_URL: ${REACT_APP_API_URL}
-        REACT_APP_SOCKET_URL: ${REACT_APP_SOCKET_URL}
+        # React sends requests to Nginx (Port 4000)
+        REACT_APP_API_URL: "http://localhost:4000"
+        REACT_APP_SOCKET_URL: "http://localhost:4000"
     ports:
       - "3000:80"
     depends_on:
-      - backend
+      - nginx
+    stdin_open: true
+    tty: true
     restart: always
 
-  backend:
+  # --- 3. BACKEND 1 (Hidden Internal Service) ---
+  backend_4000:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    ports:
-      - "4000:4000"
     environment:
       - PORT=4000
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
+      - DB_HOST=mysql_db
+      - DB_PORT=3306      # <--- CRITICAL: Must be 3306 inside Docker
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
       - DB_NAME=${DB_NAME}
@@ -34,6 +50,26 @@ services:
       - mysql_db
     restart: always
 
+  # --- 4. BACKEND 2 (Hidden Internal Service) ---
+  backend_4001:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      - PORT=4001
+      - DB_HOST=mysql_db
+      - DB_PORT=3306      # <--- CRITICAL: Must be 3306 inside Docker
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
+      - REDIS_URL=${REDIS_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+    depends_on:
+      - mysql_db
+    restart: always
+
+  # --- 5. DATABASE (MySQL) ---
   mysql_db:
     image: mysql:8.0
     container_name: chat_mysql
@@ -41,10 +77,11 @@ services:
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
       MYSQL_DATABASE: ${DB_NAME}
     ports:
-      - "3307:3306"
+      - "3308:3306" # Allows you to connect via Workbench on Port 3307
     volumes:
       - mysql_data:/var/lib/mysql
     restart: always
 
+# Define where to store the database files permanently
 volumes:
   mysql_data:
